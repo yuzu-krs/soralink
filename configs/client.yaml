@@ -1,0 +1,7 @@
+server: "your-vps-ip:4610"
+auth_token: "change-me-to-a-secure-token"
+tunnels:
+  - local_port: 3000
+    remote_port: 0
+    protocol: "tcp"
+log_level: "info"

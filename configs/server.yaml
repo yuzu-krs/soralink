@@ -1,0 +1,6 @@
+control_port: 4610
+auth_token: "change-me-to-a-secure-token"
+port_range:
+  min: 10000
+  max: 20000
+log_level: "info"
