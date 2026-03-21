@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yuzut/soralink/internal/protocol"
@@ -26,6 +27,9 @@ type Server struct {
 	listener net.Listener
 	tunnels  *TunnelManager
 	pending  sync.Map
+
+	clientsMu sync.Mutex
+	clients   map[net.Conn]struct{}
 }
 
 // NewServer はサーバーを初期化する
@@ -35,6 +39,7 @@ func NewServer(cfg *Config, logger *slog.Logger) *Server {
 		cfg:     cfg,
 		logger:  logger,
 		tunnels: NewTunnelManager(min, max),
+		clients: make(map[net.Conn]struct{}),
 	}
 }
 
@@ -48,12 +53,45 @@ func (s *Server) Run(ctx context.Context) error {
 	s.listener = ln
 	s.logger.Info("server started", "control_port", s.cfg.EffectiveControlPort())
 
-	go func() { // goroutine: wait for context cancellation to close listener
+	go func() { // goroutine: wait for context cancellation to initiate graceful shutdown
 		<-ctx.Done()
-		ln.Close()
+		s.shutdown()
 	}()
 
 	return s.acceptLoop(ctx)
+}
+
+// shutdown はサーバーの graceful shutdown を実行する
+func (s *Server) shutdown() {
+	s.logger.Info("initiating graceful shutdown")
+
+	// 1. 新規接続の受付を停止
+	if s.listener != nil {
+		s.listener.Close()
+	}
+
+	// 2. 全クライアントにシャットダウンを通知
+	s.clientsMu.Lock()
+	for conn := range s.clients {
+		errMsg := &protocol.MsgError{Message: "server shutting down"}
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		protocol.WriteMessage(conn, protocol.MsgTypeError, errMsg) //nolint:errcheck
+	}
+	s.clientsMu.Unlock()
+}
+
+// addClient は接続中クライアントを追跡する
+func (s *Server) addClient(conn net.Conn) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	s.clients[conn] = struct{}{}
+}
+
+// removeClient はクライアントの追跡を解除する
+func (s *Server) removeClient(conn net.Conn) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	delete(s.clients, conn)
 }
 
 // acceptLoop は接続を受け付けて振り分ける
@@ -117,6 +155,41 @@ func (s *Server) handleControlConn(ctx context.Context, conn net.Conn, authPaylo
 
 	s.logger.Info("client authenticated", "remote", conn.RemoteAddr())
 
+	// クライアント追跡
+	s.addClient(conn)
+	defer s.removeClient(conn)
+
+	// Ping/Pong ヘルスチェック
+	var lastPong atomic.Int64
+	lastPong.Store(time.Now().UnixNano())
+
+	pingCtx, pingCancel := context.WithCancel(ctx)
+	defer pingCancel()
+
+	go func() { // goroutine: ping ticker for client health check
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-ticker.C:
+				last := time.Unix(0, lastPong.Load())
+				if time.Since(last) > 60*time.Second {
+					s.logger.Warn("client pong timeout, disconnecting", "remote", conn.RemoteAddr())
+					conn.Close()
+					return
+				}
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := protocol.WriteFrame(conn, protocol.MsgTypePing, nil); err != nil {
+					s.logger.Debug("failed to send ping", "remote", conn.RemoteAddr(), "err", err)
+					return
+				}
+				conn.SetWriteDeadline(time.Time{})
+			}
+		}
+	}()
+
 	// メッセージループ
 	for {
 		select {
@@ -140,10 +213,14 @@ func (s *Server) handleControlConn(ctx context.Context, conn net.Conn, authPaylo
 		case protocol.MsgTypeRequestTunnel:
 			s.handleTunnelRequest(conn, payload)
 		case protocol.MsgTypePing:
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := protocol.WriteFrame(conn, protocol.MsgTypePong, nil); err != nil {
 				s.logger.Debug("failed to send pong", "err", err)
 				return
 			}
+			conn.SetWriteDeadline(time.Time{})
+		case protocol.MsgTypePong:
+			lastPong.Store(time.Now().UnixNano())
 		case protocol.MsgTypeCloseTunnel:
 			s.handleCloseTunnel(payload)
 		default:

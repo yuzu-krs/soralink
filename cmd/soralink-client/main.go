@@ -68,7 +68,7 @@ func main() {
 	defer cancel()
 
 	c := client.NewClient(cfg, logger)
-	if err := c.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := c.RunWithRetry(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("client stopped with error", "err", err)
 		os.Exit(1)
 	}

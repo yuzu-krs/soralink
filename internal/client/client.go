@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
 	"time"
 
@@ -26,6 +27,43 @@ func NewClient(cfg *Config, logger *slog.Logger) *Client {
 		cfg:     cfg,
 		logger:  logger,
 		tunnels: make(map[string]int),
+	}
+}
+
+// RunWithRetry は Exponential Backoff + Jitter で自動再接続する
+func (c *Client) RunWithRetry(ctx context.Context) error {
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		err := c.Run(ctx)
+
+		// context がキャンセルされたら終了
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// 認証失敗は再接続しない
+		if errors.Is(err, protocol.ErrAuthFailed) {
+			return err
+		}
+
+		c.logger.Warn("disconnected from server, reconnecting...", "err", err, "backoff", backoff)
+
+		jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff + jitter):
+		}
+
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+
+		// 再接続のために状態をリセット
+		c.tunnels = make(map[string]int)
 	}
 }
 
@@ -82,7 +120,7 @@ func (c *Client) authenticate() error {
 		return fmt.Errorf("unmarshal auth response: %w", err)
 	}
 	if !resp.Success {
-		return fmt.Errorf("authentication failed: %s", resp.Message)
+		return fmt.Errorf("%w: %s", protocol.ErrAuthFailed, resp.Message)
 	}
 
 	c.logger.Info("authenticated successfully")

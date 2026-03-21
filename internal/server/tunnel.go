@@ -178,7 +178,14 @@ func (t *Tunnel) AcceptLoop(server *Server) {
 
 			select {
 			case dataConn := <-p.ch:
-				Bridge(extConn, dataConn)
+				result := Bridge(extConn, dataConn)
+				slog.Info("connection completed",
+					"tunnel_id", t.ID,
+					"connection_id", cID,
+					"bytes_out", result.BytesOut,
+					"bytes_in", result.BytesIn,
+					"duration", result.Duration,
+				)
 			case <-time.After(10 * time.Second):
 				slog.Warn("data connection timeout", "connection_id", cID)
 				extConn.Close()
