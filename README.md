@@ -1,10 +1,11 @@
 <p align="center">
-  <h1 align="center">Soralink</h1>
-  <p align="center">
-    A self-hosted TCP tunnel and relay service that exposes your local server to the internet<br>
-    without port forwarding or NAT configuration — just run it on your own VPS.<br>
-    Open-source alternative to ngrok / playit.gg.
-  </p>
+  <img src="assets/soralink-icon.png" alt="Soralink" width="180">
+</p>
+<h1 align="center">Soralink</h1>
+<p align="center">
+  A self-hosted TCP tunnel and relay service that exposes your local server to the internet<br>
+  without port forwarding or NAT configuration — just run it on your own VPS.<br>
+  Open-source alternative to ngrok / playit.gg.
 </p>
 
 <p align="center">
