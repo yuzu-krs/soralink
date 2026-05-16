@@ -1,6 +1,0 @@
-bin/
-*.exe
-*.log
-
-# Local config overrides (may contain real tokens/IPs)
-configs/*.local.yaml
