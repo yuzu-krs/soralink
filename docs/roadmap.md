@@ -2,7 +2,7 @@
 
 ## 方針
 
-Soralink はネットワーク基盤が中心の OSS サービスなので、最初に「つながる」「切れたら戻る」「漏れない」を固める。その後に Supabase Auth / RLS、dashboard、カスタムドメイン、Stripe 課金などの SaaS 機能を足す。
+Soralink はネットワーク基盤が中心の OSS サービスなので、最初に「つながる」「切れたら戻る」「漏れない」を固める。その後に Auth.js、Prisma、SQLite、dashboard、カスタムドメイン、Stripe 課金などの SaaS 機能を足す。
 
 初期 Relay は開発者所有のグローバル IP 付き VPS 1 台で動かす。UDP は優先度低めとし、HTTP/TCP が安定してから扱う。
 
@@ -13,14 +13,17 @@ Soralink はネットワーク基盤が中心の OSS サービスなので、最
 - 要件定義、技術仕様、MVP 範囲を決める。
 - Hosted SaaS と Self-hosted の優先順位を決める。
 - 使用ドメイン、Relay の公開方式、トークン方式を決める。
-- Supabase schema、RLS policy、GitHub OAuth 設定方針を決める。
+- Auth.js GitHub OAuth、Prisma schema、SQLite 運用方針を決める。
 - OSS としての secret 管理、`.env.example`、`SECURITY.md` の方針を決める。
+- support / terms / privacy-policy / law の公開ページ方針を決める。
 - Stripe のプラン構成と Webhook 同期方針を決める。
 
 成果物:
 
 - `docs/requirements.md`
 - `docs/technical-spec.md`
+- `docs/tech-stack.md`
+- `docs/frontend-spec.md`
 - `docs/roadmap.md`
 
 ## Phase 1: Core TCP Tunnel
@@ -36,7 +39,8 @@ Soralink はネットワーク基盤が中心の OSS サービスなので、最
 - `soralink relay` または `soralink-server`
 - `soralink tcp <port>` または `soralink-client`
 - token 認証
-- Supabase `agent_tokens` table と最小 RLS policy
+- Prisma `AgentToken` schema
+- SQLite による token metadata 永続化
 - TCP port 自動割り当て
 - 外部 TCP connection の bridge
 - Agent 切断時の cleanup
@@ -93,28 +97,32 @@ Soralink はネットワーク基盤が中心の OSS サービスなので、最
 - 長時間接続で goroutine / fd leak が発生しない。
 - HTTP endpoint が HTTPS でアクセスできる。
 
-## Phase 4: Token / Dashboard MVP
+## Phase 4: Auth.js / Dashboard MVP
 
 目的:
 
-- Supabase Auth の GitHub OAuth でログインし、Web で token を取得する体験を実現する。
+- Auth.js の GitHub OAuth でログインし、Web で token を取得する体験を実現する。
 
 機能:
 
-- Supabase Auth GitHub OAuth
+- Auth.js GitHub OAuth
+- Prisma Adapter
+- SQLite database session
 - token 発行/失効
 - active tunnel 一覧
 - tunnel 停止
-- Supabase Postgres
-- RLS policy
-- Supabase JWT 検証
-- secret/service role key の backend 限定運用
+- Prisma schema / migration
+- userId scoped API query
+- SQLite backup / restore 方針
+- support / terms / privacy-policy / law の公開ページ
 
 完了条件:
 
 - Web で token を作成し、`soralink auth <TOKEN>` で使える。
 - dashboard に active tunnel が表示される。
-- 別ユーザーの token / tunnel metadata が RLS で読めない。
+- 別ユーザーの token / tunnel metadata が API 経由で読めない。
+- SQLite DB ファイルが repository に含まれない。
+- 法務・サポート系の公開ページがログインなしで閲覧できる。
 
 ## Phase 5: Endpoint 管理
 
@@ -168,18 +176,23 @@ Soralink はネットワーク基盤が中心の OSS サービスなので、最
 - organization / team
 - plan / quota
 - usage 集計
+- Free / Pro / Team / Enterprise plan 定義
+- 定額 subscription の quota 制御
 - Stripe Checkout
 - Stripe Customer Portal
 - Stripe Webhook 署名検証
-- Stripe subscription と Supabase `billing_customers` の同期
+- Stripe subscription と SQLite `BillingCustomer` の同期
 - abuse detection
+- PostgreSQL 移行検討
 - multi-region Relay
 - admin console
 
 完了条件:
 
 - Free / Pro などの plan に応じて tunnel 数や転送量を制限できる。
+- MVP では従量課金を使わず、上限到達時に新規 tunnel / connection を制限できる。
 - 請求状態と quota が連動する。
+- SQLite の限界が見えた場合に PostgreSQL へ移行できる。
 - 複数 Relay に tunnel を分散できる。
 
 ## Phase 8: UDP / ゲームサーバー
@@ -205,15 +218,16 @@ Soralink はネットワーク基盤が中心の OSS サービスなので、最
 1. `protocol` package
 2. `relay` の control connection
 3. token 認証
-4. Supabase `agent_tokens` schema と RLS
-5. TCP port allocator
-6. TCP bridge
-7. Agent CLI の `tcp`
-8. HTTP reverse proxy
-9. Agent CLI の `http`
-10. reconnect / heartbeat
-11. HTTPS
-12. Supabase Auth GitHub OAuth dashboard
-13. Stripe billing
+4. Prisma `AgentToken` schema
+5. SQLite + Prisma migration
+6. TCP port allocator
+7. TCP bridge
+8. Agent CLI の `tcp`
+9. HTTP reverse proxy
+10. Agent CLI の `http`
+11. reconnect / heartbeat
+12. HTTPS
+13. Auth.js GitHub OAuth dashboard
+14. Stripe billing
 
 この順にすると、早い段階で「本当にトンネルとして機能するか」を確認できる。

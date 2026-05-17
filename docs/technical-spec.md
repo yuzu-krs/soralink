@@ -8,16 +8,17 @@
 | --- | --- | --- |
 | 言語 | Go | ネットワーク処理、並行処理、single binary 配布に向いているため採用 |
 | CLI | Cobra | `auth`, `http`, `tcp`, `start`, `status` などのサブコマンドを扱う |
-| Dashboard | Next.js App Router + TypeScript | Supabase Auth / Stripe と連携する Web 管理画面 |
+| Dashboard | Next.js App Router + TypeScript | Auth.js / Prisma / Stripe と連携する Web 管理画面 |
 | UI | Tailwind CSS + shadcn/ui + lucide-react | OSS で調整しやすいコンポーネント構成 |
 | Relay | Go `net`, `net/http`, `crypto/tls` | HTTP/TCP の中継を標準ライブラリ中心で実装 |
 | 多重化 | yamux または独自 frame | MVP は実装しやすさ優先。production は yamux などを検討 |
-| DB | Supabase Postgres | Hosted/SaaS の主 DB として使用。RLS policy を必須にする |
-| 認証 | Supabase Auth | GitHub OAuth のみ対応。独自 password auth は実装しない |
+| DB | SQLite | 初期 VPS 1 台で扱いやすいファイル DB として使用 |
+| ORM | Prisma | schema、migration、型安全な DB access |
+| 認証 | Auth.js | GitHub OAuth のみ対応。独自 password auth は実装しない |
 | 課金 | Stripe | Checkout、Customer Portal、Webhook で subscription を管理 |
 | 証明書 | autocert / lego | ワイルドカードや DNS-01 が必要になったら lego |
 | メトリクス | Prometheus | Phase 2 以降 |
-| ホスティング | グローバル IP 付き VPS 1 台 | 初期 Relay / Edge として使用 |
+| ホスティング | グローバル IP 付き VPS 1 台 | 初期 Relay / Edge / Dashboard を集約 |
 | デプロイ | Docker Compose + Caddy | 単一 VPS 上で Dashboard / Relay / reverse proxy を運用 |
 
 ## 2. 全体アーキテクチャ
@@ -29,36 +30,40 @@ flowchart LR
     Relay --> Agent
     Agent --> Local["localhost service\nWeb app / SSH / DB"]
 
-    Dashboard["Dashboard"] --> SupabaseAuth["Supabase Auth\nGitHub OAuth"]
-    Dashboard --> SupabaseDB["Supabase Postgres\nRLS enabled"]
+    Dashboard["Dashboard\nNext.js"] --> Auth["Auth.js\nGitHub OAuth"]
+    Dashboard --> DB["SQLite\nPrisma ORM"]
     Dashboard --> Stripe["Stripe\nCheckout / Portal"]
-    Backend["Control Plane API"] --> SupabaseDB
+    Backend["Control Plane API"] --> DB
     Backend --> Stripe
     Relay --> Backend
 ```
 
-Hosted SaaS では Relay / Control Plane / Dashboard を分ける。初期 MVP では Relay は開発者所有の VPS 1 台で動かし、認証・DB・課金は Supabase / Stripe に任せる。
+Hosted SaaS では Relay / Control Plane / Dashboard を分ける。初期 MVP では Relay、Dashboard、SQLite DB を開発者所有の VPS 1 台で動かし、課金は Stripe に任せる。
 
 ```mermaid
 sequenceDiagram
     actor User
     participant Dashboard
-    participant Supabase as Supabase Auth
+    participant Auth as Auth.js
+    participant GitHub
     participant API as Control Plane API
-    participant DB as Supabase Postgres
+    participant DB as SQLite / Prisma
     participant Agent
     participant Relay as VPS Relay
 
     User->>Dashboard: Login with GitHub
-    Dashboard->>Supabase: OAuth start
-    Supabase-->>Dashboard: Session / JWT
+    Dashboard->>Auth: signIn("github")
+    Auth->>GitHub: OAuth authorization
+    GitHub-->>Auth: OAuth callback
+    Auth->>DB: Upsert user/account/session
+    Auth-->>Dashboard: Session cookie
     Dashboard->>API: Create agent token
-    API->>DB: Insert token hash with user_id
+    API->>DB: Insert token hash with userId
     API-->>Dashboard: Show token once
     User->>Agent: soralink auth <TOKEN>
     Agent->>Relay: Connect with token
     Relay->>API: Verify token prefix + hash
-    API-->>Relay: user_id / plan / limits
+    API-->>Relay: userId / plan / limits
     Relay-->>Agent: Session ready
 ```
 
@@ -89,7 +94,7 @@ soralink status
 責務:
 
 - Agent 接続を受け付ける。
-- Agent token を検証する。
+- Agent token を Control Plane API 経由で検証する。
 - tunnel endpoint を割り当てる。
 - HTTP Host / TCP port から tunnel を解決する。
 - 外部 connection と Agent stream を bridge する。
@@ -99,20 +104,23 @@ soralink status
 
 責務:
 
-- Supabase JWT を検証し、ログイン済みユーザーとして API を処理する。
+- Auth.js session を検証し、ログイン済みユーザーとして API を処理する。
 - Agent token 発行、失効。
 - domain / endpoint / quota 管理。
 - active tunnel 表示。
 - dashboard へ JSON API を提供する。
 - Stripe Checkout session 作成、Customer Portal session 作成、Webhook 受信。
+- Relay からの内部 API request を `SORALINK_RELAY_INTERNAL_SECRET` で認証する。
 
-ユーザー登録、ログイン、OAuth callback は Supabase Auth が担当する。Control Plane API は独自に password を保持しない。
+ユーザー登録、ログイン、OAuth callback は Auth.js が担当する。Control Plane API は独自に password を保持しない。
 
 ### 3.4 Dashboard
 
+画面構成、routes、状態設計、UI コンポーネントは [フロントエンド画面仕様](./frontend-spec.md) を正とする。
+
 責務:
 
-- Supabase Auth の GitHub OAuth でログインする。
+- Auth.js の GitHub OAuth でログインする。
 - token 発行画面。
 - active tunnel 一覧。
 - usage 表示。
@@ -120,14 +128,14 @@ soralink status
 - request log / inspection 表示。
 - Stripe Customer Portal への導線を提供する。
 
-### 3.5 Supabase
+### 3.5 Auth.js / Prisma / SQLite
 
 責務:
 
 - GitHub OAuth によるユーザー認証。
-- `auth.users` を信頼できる user identity として扱う。
-- アプリ用テーブルを Supabase Postgres に保存する。
-- RLS policy によりユーザーごとのデータ分離を DB 側で強制する。
+- Auth.js Prisma Adapter による User / Account / Session の永続化。
+- Soralink 独自テーブルの管理。
+- Prisma query の `userId` 条件によりユーザーごとのデータ分離を強制する。
 
 ### 3.6 Stripe
 
@@ -136,6 +144,18 @@ soralink status
 - Checkout による subscription 作成。
 - Customer Portal による支払い方法、請求履歴、解約管理。
 - Webhook による subscription 状態の同期。
+- plan / quota / entitlement の判定。
+
+初期 plan:
+
+| Plan | 月額 | entitlement |
+| --- | ---: | --- |
+| Free | 0円 | 1 active tunnel、5GB/月、Hosted TCP は invite / disabled |
+| Pro | 1,200円 | 5 active tunnel、100GB/月、予約 subdomain 3、固定 TCP port 2 |
+| Team | 4,800円 | 5 seats、20 active tunnel、1TB/月、custom domain 10 |
+| Enterprise | 個別見積 | dedicated Relay、SLA、個別 quota |
+
+MVP では Stripe の usage-based billing は使わず、Soralink 側の利用量集計で quota を制御する。Stripe には subscription status と price id の同期だけを求める。
 
 ## 4. ネットワーク設計
 
@@ -370,26 +390,11 @@ tunnels:
 | `soralink logout` | 保存 token を削除 |
 | `soralink version` | version 表示 |
 
-### 8.3 出力例
-
-```text
-Soralink 0.1.0
-Status: connected
-Region: jp
-
-Forwarding:
-  https://blue-sky-123.soralink.dev -> http://localhost:3000
-
-Requests:
-  GET /api/health 200 12ms
-  POST /webhook   204 31ms
-```
-
 ## 9. Control Plane API 仕様
 
 ### 9.1 認証方針
 
-ログインは Supabase Auth の GitHub OAuth のみを使用する。Soralink の API は、Dashboard から送られる Supabase JWT を検証して `user_id` を確定する。
+ログインは Auth.js の GitHub OAuth のみを使用する。Soralink の API は、Dashboard から送られる Auth.js session cookie を `auth()` で検証して `userId` を確定する。
 
 Soralink 独自の signup/password login endpoint は持たない。
 
@@ -397,16 +402,16 @@ Soralink 独自の signup/password login endpoint は持たない。
 sequenceDiagram
     actor User
     participant Browser
-    participant Supabase
+    participant Auth as Auth.js
     participant GitHub
     participant API as Soralink API
 
     User->>Browser: Click "Continue with GitHub"
-    Browser->>Supabase: signInWithOAuth(provider: github)
-    Supabase->>GitHub: OAuth authorization
-    GitHub-->>Supabase: OAuth callback
-    Supabase-->>Browser: Session / JWT
-    Browser->>API: Authorization: Bearer <Supabase JWT>
+    Browser->>Auth: signIn("github")
+    Auth->>GitHub: OAuth authorization
+    GitHub-->>Auth: OAuth callback
+    Auth-->>Browser: Session cookie
+    Browser->>API: Cookie: Auth.js session
     API-->>Browser: User-scoped response
 ```
 
@@ -425,7 +430,7 @@ Token 作成レスポンス例:
   "id": "tok_123",
   "name": "macbook",
   "token": "slk_live_xxxxxxxxx",
-  "created_at": "2026-05-16T00:00:00Z"
+  "created_at": "2026-05-17T00:00:00Z"
 }
 ```
 
@@ -439,216 +444,144 @@ Token 作成レスポンス例:
 | `GET` | `/api/v1/tunnels/{id}` | tunnel 詳細 |
 | `DELETE` | `/api/v1/tunnels/{id}` | tunnel 停止 |
 
-レスポンス例:
-
-```json
-{
-  "id": "tun_abc123",
-  "protocol": "http",
-  "public_url": "https://blue-sky-123.soralink.dev",
-  "local_addr": "127.0.0.1:3000",
-  "agent_id": "agt_123",
-  "created_at": "2026-05-16T00:00:00Z",
-  "active_connections": 2,
-  "bytes_in": 1048576,
-  "bytes_out": 2048576
-}
-```
-
 ### 9.4 Billing API
 
 | Method | Path | 説明 |
 | --- | --- | --- |
+| `GET` | `/api/v1/billing/plans` | plan 一覧と quota |
+| `GET` | `/api/v1/billing/usage` | 現在 period の usage / quota |
 | `POST` | `/api/v1/billing/checkout` | Stripe Checkout session 作成 |
 | `POST` | `/api/v1/billing/portal` | Stripe Customer Portal session 作成 |
 | `POST` | `/api/v1/stripe/webhook` | Stripe Webhook 受信 |
 
 Webhook endpoint は Stripe の署名検証に成功した payload のみ処理する。検証前に JSON parse で body を変形しないよう、raw body を保持する。
 
+Checkout 作成時、server は `plan` から許可済み Stripe price id を引き、client から渡された price id をそのまま使わない。
+
 ## 10. データモデル
 
-Supabase Auth が `auth.users` を管理する。Soralink のアプリ用テーブルでは `user_id uuid references auth.users(id)` を持たせ、RLS policy の基本条件を `user_id = auth.uid()` にする。
+Auth.js Prisma Adapter の標準モデルを基礎にし、Soralink 独自モデルを追加する。ID は Prisma の `String @id @default(cuid())` を基本とする。
 
-### 10.1 auth.users
+### 10.1 Auth.js models
 
-Supabase 管理テーブル。Soralink 側で直接 migration 管理しない。
+| Model | 用途 |
+| --- | --- |
+| `User` | Auth.js user。Soralink の owner |
+| `Account` | GitHub OAuth account |
+| `Session` | Auth.js database session |
+| `VerificationToken` | Auth.js 互換用。GitHub OAuth のみなら利用頻度は低い |
 
-| Column | Type | 説明 |
+### 10.2 Profile
+
+| Field | Type | 説明 |
 | --- | --- | --- |
-| id | uuid | Supabase user id |
-| email | text | GitHub OAuth から取得される email。取得できない場合がある |
-| created_at | timestamptz | 作成日時 |
+| id | String | profile id |
+| userId | String | `User.id` |
+| githubUsername | String? | GitHub username |
+| displayName | String? | 表示名 |
+| avatarUrl | String? | avatar |
+| createdAt | DateTime | 作成日時 |
+| updatedAt | DateTime | 更新日時 |
 
-### 10.2 profiles
+### 10.3 AgentToken
 
-| Column | Type | 説明 |
+`AgentToken` は secret hash を含むため、Dashboard API は一覧 response で `secretHash` を返さない。
+
+| Field | Type | 説明 |
 | --- | --- | --- |
-| user_id | uuid | `auth.users.id` |
-| github_username | text nullable | GitHub username |
-| display_name | text nullable | 表示名 |
-| avatar_url | text nullable | avatar |
-| created_at | timestamptz | 作成日時 |
-| updated_at | timestamptz | 更新日時 |
+| id | String | token id |
+| userId | String | owner |
+| name | String | 表示名 |
+| prefix | String | token 検索用 prefix |
+| secretHash | String | token 検証用 hash |
+| lastUsedAt | DateTime? | 最終利用 |
+| revokedAt | DateTime? | 失効日時 |
+| createdAt | DateTime | 作成日時 |
 
-RLS:
+### 10.4 Endpoint
 
-- `select`: `user_id = auth.uid()`
-- `insert`: `user_id = auth.uid()`
-- `update`: `user_id = auth.uid()`
-
-### 10.3 agent_tokens
-
-`agent_tokens` は secret hash を含むため、Dashboard frontend からテーブルを直接 select させない。実装では次のどちらかを採用する。
-
-- `private.agent_tokens` のように Data API 非公開の schema に置き、backend API / security definer RPC だけが読む。
-- `public.agent_tokens` に置く場合でも `secret_hash` への column privilege を client role に与えず、一覧表示は `agent_token_summaries` view から返す。
-
-| Column | Type | 説明 |
+| Field | Type | 説明 |
 | --- | --- | --- |
-| id | uuid | token id |
-| user_id | uuid | owner |
-| name | text | 表示名 |
-| prefix | text | token 検索用 prefix |
-| secret_hash | text | token 検証用 hash。client には返さない |
-| last_used_at | timestamptz nullable | 最終利用 |
-| revoked_at | timestamptz nullable | 失効日時 |
-| created_at | timestamptz | 作成日時 |
+| id | String | endpoint id |
+| userId | String | owner |
+| protocol | String | http/tcp |
+| hostname | String? | HTTP hostname |
+| tcpPort | Int? | TCP port |
+| reserved | Boolean | 予約済みか |
+| createdAt | DateTime | 作成日時 |
 
-RLS:
-
-- `select`: Dashboard frontend から直接許可しない。表示用 view/RPC は `user_id = auth.uid()` で絞り、`secret_hash` を返さない。
-- `insert`: Dashboard から直接 insert させず、backend API または RPC で token を生成する。
-- `update`: `user_id = auth.uid()` かつ更新可能列を `name`, `revoked_at` に限定する。
-- `delete`: 原則物理削除しない。失効は `revoked_at` 更新で表す。
-
-### 10.4 endpoints
-
-| Column | Type | 説明 |
-| --- | --- | --- |
-| id | uuid | endpoint id |
-| user_id | uuid | owner |
-| protocol | text | http/tcp |
-| hostname | text nullable | HTTP hostname |
-| tcp_port | int nullable | TCP port |
-| reserved | bool | 予約済みか |
-| created_at | timestamptz | 作成日時 |
-
-RLS:
-
-- `select`: `user_id = auth.uid()`
-- `insert/update/delete`: `user_id = auth.uid()` かつ quota check は backend 側で実施する。
-
-### 10.5 tunnel_sessions
+### 10.5 TunnelSession
 
 active state はメモリ中心でよいが、監査や dashboard のため永続化してもよい。
 
-| Column | Type | 説明 |
+| Field | Type | 説明 |
 | --- | --- | --- |
-| id | uuid | session id |
-| user_id | uuid | owner |
-| agent_token_id | uuid | token |
-| relay_id | text | Relay |
-| connected_at | timestamptz | 接続日時 |
-| disconnected_at | timestamptz nullable | 切断日時 |
+| id | String | session id |
+| userId | String | owner |
+| agentTokenId | String | token |
+| relayId | String | Relay |
+| connectedAt | DateTime | 接続日時 |
+| disconnectedAt | DateTime? | 切断日時 |
 
-RLS:
+### 10.6 ConnectionLog
 
-- `select`: `user_id = auth.uid()`
-- `insert/update`: Relay/backend のみ。client から直接書かせない。
-
-### 10.6 connection_logs
-
-| Column | Type | 説明 |
+| Field | Type | 説明 |
 | --- | --- | --- |
-| id | uuid | log id |
-| user_id | uuid | owner |
-| tunnel_id | uuid | tunnel |
-| protocol | text | http/tcp |
-| remote_addr | text | 接続元 |
-| method | text nullable | HTTP method |
-| path | text nullable | HTTP path |
-| status | int nullable | HTTP status |
-| bytes_in | int64 | inbound bytes |
-| bytes_out | int64 | outbound bytes |
-| duration_ms | int | 所要時間 |
-| started_at | timestamptz | 開始 |
-| ended_at | timestamptz | 終了 |
+| id | String | log id |
+| userId | String | owner |
+| tunnelId | String | tunnel |
+| protocol | String | http/tcp |
+| remoteAddr | String | 接続元 |
+| method | String? | HTTP method |
+| path | String? | HTTP path |
+| status | Int? | HTTP status |
+| bytesIn | BigInt | inbound bytes |
+| bytesOut | BigInt | outbound bytes |
+| durationMs | Int | 所要時間 |
+| startedAt | DateTime | 開始 |
+| endedAt | DateTime | 終了 |
 
-RLS:
+### 10.7 BillingCustomer
 
-- `select`: `user_id = auth.uid()`
-- `insert`: Relay/backend のみ。client から直接書かせない。
-
-### 10.7 billing_customers
-
-| Column | Type | 説明 |
+| Field | Type | 説明 |
 | --- | --- | --- |
-| user_id | uuid | owner |
-| stripe_customer_id | text | Stripe customer |
-| stripe_subscription_id | text nullable | subscription |
-| plan | text | free/pro/team など |
-| status | text | active/trialing/past_due/canceled など |
-| current_period_end | timestamptz nullable | 現在期間終了 |
-| updated_at | timestamptz | 更新日時 |
+| userId | String | owner |
+| stripeCustomerId | String | Stripe customer |
+| stripeSubscriptionId | String? | subscription |
+| stripePriceId | String? | 有効な Stripe price |
+| plan | String | free/pro/team など |
+| planInterval | String? | month/year |
+| status | String | active/trialing/past_due/canceled など |
+| currentPeriodEnd | DateTime? | 現在期間終了 |
+| graceEndsAt | DateTime? | 支払い失敗時の猶予終了 |
+| updatedAt | DateTime | 更新日時 |
 
-RLS:
-
-- `select`: `user_id = auth.uid()`
-- `insert/update`: Stripe Webhook を処理する backend のみ。
-
-## 11. Relay 内部構造
-
-Go package 例:
+## 11. リポジトリ構造
 
 ```text
-cmd/
-  soralink/
-    main.go
-internal/
-  agent/
-  relay/
-    server.go
-    tunnel.go
-    http_proxy.go
-    tcp_proxy.go
-    bridge.go
-  protocol/
-    frame.go
-    message.go
-  controlplane/
-    api.go
-    auth.go
-    tokens.go
-    billing.go
-  store/
-    supabase.go
-    rls.sql
-```
-
-主要 interface:
-
-```go
-type Tunnel struct {
-    ID        string
-    UserID    string
-    Protocol  string
-    PublicURL string
-    LocalAddr string
-    SessionID string
-}
-
-type Session interface {
-    ID() string
-    OpenStream(ctx context.Context, tunnelID string) (net.Conn, error)
-    Close() error
-}
-
-type TunnelRegistry interface {
-    Register(t *Tunnel) error
-    FindByHost(host string) (*Tunnel, bool)
-    FindByTCPPort(port int) (*Tunnel, bool)
-    Remove(tunnelID string) error
-}
+soralink/
+  apps/
+    web/
+      app/
+      auth.ts
+      prisma.ts
+  cmd/
+    soralink/
+    soralink-relay/
+  internal/
+    agent/
+    relay/
+    protocol/
+  packages/
+    controlplane/
+    db/
+  prisma/
+    schema.prisma
+    migrations/
+  deploy/
+    caddy/
+    docker-compose.yml
+    systemd/
 ```
 
 ## 12. セキュリティ仕様
@@ -661,12 +594,6 @@ Soralink は OSS として開発するため、公開リポジトリに漏れた
 slk_<env>_<prefix>_<secret>
 ```
 
-例:
-
-```text
-slk_live_abcd1234_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
 - `prefix` で DB 検索する。
 - `secret` は hash と constant-time compare で検証する。
 - token は作成時しか表示しない。
@@ -676,69 +603,40 @@ slk_live_abcd1234_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 MVP:
 
 - TLS 上で token を送る。
-- Relay は hash 検証する。
+- Relay は Control Plane API へ token prefix + secret を渡し、検証結果だけを受け取る。
+- Control Plane API は token を hash 検証し、`userId`, plan, limit を返す。
 
 Phase 2:
 
 - nonce + HMAC-SHA256 による challenge response を追加する。
 - token 本体を毎回送らない方式へ移行する。
 
-### 12.3 Supabase keys
+### 12.3 Auth.js / GitHub OAuth keys
 
 | Key | 利用場所 | 取り扱い |
 | --- | --- | --- |
-| Supabase publishable key | Dashboard frontend | 公開 client に置いてよい。ただし RLS 前提 |
-| Supabase secret key / service role key | Control Plane API / Relay backend | 環境変数のみ。公開 client、CLI、リポジトリ、ログに出さない |
-| Supabase JWT | Dashboard -> API | `Authorization: Bearer` で送信し、API 側で検証 |
+| `AUTH_SECRET` | Dashboard server | 環境変数のみ。session 署名/暗号化に使用 |
+| `AUTH_GITHUB_ID` | Dashboard server | GitHub OAuth client id |
+| `AUTH_GITHUB_SECRET` | Dashboard server | 環境変数のみ。公開禁止 |
+| `DATABASE_URL` | Dashboard server / Prisma | SQLite file path。browser に出さない |
 
-secret key / service role key は RLS を迂回できる権限を持つため、使用箇所を backend の最小範囲に限定する。
-
-### 12.4 RLS policy 方針
+### 12.4 Authorization 方針
 
 原則:
 
-- アプリ用テーブルは RLS を有効化する。
-- ユーザー所有データは `user_id = auth.uid()` を基本条件にする。
-- secret を含む列は RLS だけに頼らず、private schema、column privilege、view、RPC、backend API のいずれかで client から直接 select できないようにする。
-- Relay/backend だけが書き込む operational data は、client から insert/update/delete できない policy にする。
-- migration に RLS policy を含め、PR レビュー対象にする。
+- Dashboard API は必ず Auth.js session を検証する。
+- user-owned table は必ず `userId = session.user.id` で絞る。
+- `secretHash` などの秘匿列は response DTO に含めない。
+- Relay/backend だけが書き込む operational data は internal secret で保護した API 経由に限定する。
+- Prisma Client を client component に import しない。
 
-policy 例:
+### 12.5 SQLite 保護
 
-```sql
-alter table public.endpoints enable row level security;
+- SQLite DB、WAL、SHM、backup archive は commit 禁止。
+- DB ファイルは VPS の永続 volume に置き、アプリ実行ユーザーだけが読める権限にする。
+- backup は暗号化し、復元手順を検証する。
 
-create policy "users can read own endpoints"
-on public.endpoints
-for select
-to authenticated
-using (user_id = auth.uid());
-
-create policy "users can create own endpoints"
-on public.endpoints
-for insert
-to authenticated
-with check (user_id = auth.uid());
-```
-
-token 一覧用 view 例:
-
-```sql
-create view public.agent_token_summaries as
-select
-  id,
-  user_id,
-  name,
-  prefix,
-  last_used_at,
-  revoked_at,
-  created_at
-from private.agent_tokens;
-
-alter view public.agent_token_summaries set (security_invoker = true);
-```
-
-### 12.5 Stripe keys
+### 12.6 Stripe keys
 
 | Key | 利用場所 | 取り扱い |
 | --- | --- | --- |
@@ -747,17 +645,6 @@ alter view public.agent_token_summaries set (security_invoker = true);
 | Stripe webhook signing secret | Webhook endpoint | 環境変数のみ |
 
 Webhook は raw body と `Stripe-Signature` を使って署名検証してから処理する。検証失敗時は subscription 状態を更新しない。
-
-### 12.6 Access control
-
-Endpoint ごとに以下を設定できるようにする。
-
-- IP allowlist / denylist
-- Basic Auth
-- Bearer token
-- 将来の OAuth/OIDC login
-- rate limit
-- max concurrent connections
 
 ### 12.7 Inspection privacy
 
@@ -786,32 +673,13 @@ Agent に返す代表エラー:
 
 ```json
 {
-  "time": "2026-05-16T00:00:00Z",
+  "time": "2026-05-17T00:00:00Z",
   "level": "INFO",
   "msg": "tunnel created",
   "tunnel_id": "tun_abc123",
   "user_id": "usr_123",
   "protocol": "http",
   "public_url": "https://blue-sky-123.soralink.dev"
-}
-```
-
-connection 完了ログ:
-
-```json
-{
-  "time": "2026-05-16T00:00:12Z",
-  "level": "INFO",
-  "msg": "connection closed",
-  "tunnel_id": "tun_abc123",
-  "protocol": "http",
-  "remote_addr": "203.0.113.10",
-  "method": "GET",
-  "path": "/api/health",
-  "status": 200,
-  "bytes_in": 512,
-  "bytes_out": 1024,
-  "duration_ms": 12
 }
 ```
 
@@ -828,6 +696,8 @@ connection 完了ログ:
 
 ### Integration test
 
+- Auth.js GitHub OAuth callback は mock で検証する。
+- API が別ユーザーの row を返さないことを検証する。
 - Agent -> Relay 認証
 - HTTP tunnel round trip
 - WebSocket tunnel
@@ -835,12 +705,12 @@ connection 完了ログ:
 - Agent disconnect cleanup
 - Relay restart + Agent reconnect
 
-### Load test
+### DB / migration test
 
-- concurrent tunnel 作成
-- 1 tunnel あたりの concurrent connection
-- 大容量 streaming
-- long-lived WebSocket
+- `prisma validate`
+- `prisma migrate deploy`
+- SQLite backup / restore
+- `secretHash` が API response に出ないことを検証する。
 
 ## 16. 設定例
 
@@ -857,34 +727,37 @@ relay:
     min: 10000
     max: 20000
 
-storage:
-  driver: "supabase"
-  project_url: "${SUPABASE_URL}"
-  secret_key: "${SUPABASE_SECRET_KEY}"
+control_plane:
+  base_url: "https://app.soralink.dev"
+  internal_secret: "${SORALINK_RELAY_INTERNAL_SECRET}"
 
 tls:
   mode: "manual"
   cert_file: "/etc/soralink/cert.pem"
   key_file: "/etc/soralink/key.pem"
 
-stripe:
-  secret_key: "${STRIPE_SECRET_KEY}"
-  webhook_secret: "${STRIPE_WEBHOOK_SECRET}"
-
 log:
   level: "info"
   format: "json"
 ```
 
-### Dashboard / frontend
+### Dashboard / server env
 
 ```env
-NEXT_PUBLIC_SUPABASE_URL=https://example.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_xxx
-NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_live_xxx
+AUTH_SECRET=generated-random-secret
+AUTH_GITHUB_ID=github-oauth-client-id
+AUTH_GITHUB_SECRET=github-oauth-client-secret
+DATABASE_URL=file:/var/lib/soralink/soralink.db
+STRIPE_SECRET_KEY=sk_live_xxx
+STRIPE_WEBHOOK_SECRET=whsec_xxx
+STRIPE_PRICE_PRO_MONTHLY=price_xxx
+STRIPE_PRICE_TEAM_MONTHLY=price_xxx
+STRIPE_PRICE_PRO_YEARLY=price_xxx
+STRIPE_PRICE_TEAM_YEARLY=price_xxx
+SORALINK_RELAY_INTERNAL_SECRET=generated-random-secret
 ```
 
-frontend には Supabase secret key、service role key、Stripe secret key を置かない。
+frontend には GitHub OAuth secret、Auth.js secret、Stripe secret key、`DATABASE_URL` を置かない。
 
 ### Agent project config
 
@@ -904,18 +777,20 @@ tunnels:
 ## 17. OSS セキュリティ運用
 
 - `.env`, `.env.local`, `*.pem`, `*.key`, production config は gitignore する。
+- `*.db`, `*.db-wal`, `*.db-shm`, backup archive は gitignore する。
 - `.env.example` には dummy value のみ置く。
 - GitHub Actions の secret は最小権限にし、PR from fork では secret を使う job を動かさない。
 - secret scanning と依存関係スキャンを有効化する。
-- RLS policy、token 発行、Stripe Webhook、ログ出力はセキュリティレビュー必須にする。
+- Prisma query、token 発行、Stripe Webhook、ログ出力はセキュリティレビュー必須にする。
 - Relay は VPS 上で root ではなく専用ユーザーで実行する。
 - SSH は鍵認証のみ、root login 無効、必要 port のみ firewall で開放する。
 
 ## 18. 参考情報
 
-- Supabase Auth: https://supabase.com/docs/guides/auth
-- Supabase GitHub OAuth: https://supabase.com/docs/guides/auth/social-login/auth-github
-- Supabase Row Level Security: https://supabase.com/docs/guides/database/postgres/row-level-security
-- Supabase API Keys: https://supabase.com/docs/guides/api/api-keys
+- Auth.js: https://authjs.dev/
+- Auth.js GitHub Provider: https://authjs.dev/getting-started/providers/github
+- Auth.js Prisma Adapter: https://authjs.dev/getting-started/adapters/prisma
+- Prisma SQLite: https://www.prisma.io/docs/concepts/database-connectors/sqlite
+- Prisma Migrate: https://docs.prisma.io/docs/cli/migrate
 - Stripe Subscriptions: https://docs.stripe.com/payments/subscriptions
 - Stripe Webhook Signatures: https://docs.stripe.com/webhooks/signatures
